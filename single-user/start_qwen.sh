@@ -156,6 +156,14 @@ SSE_KEEP_ALIVE=${SSE_KEEP_ALIVE-30}   # no colon: SSE_KEEP_ALIVE= keeps the empt
 # point) crashes at first forward on this torch/vllm combo — an inductor
 # codegen bug with the mixed set; use mlp or all.
 INT8_ACT=${INT8_ACT-}
+if [ "${ROCM:-0}" = 1 ]; then
+  export VLLM_ROCM_USE_AITER=${VLLM_ROCM_USE_AITER:-0}
+  export VLLM_ROCM_USE_AITER_CUSTOM_AR=${VLLM_ROCM_USE_AITER_CUSTOM_AR:-0}
+  if [ -n "${INT8_ACT:-}" ]; then
+    echo "[start_qwen] ROCM=1: ignoring INT8_ACT=$INT8_ACT (Marlin W4A8 is CUDA-only)" >&2
+    INT8_ACT=
+  fi
+fi
 INT8_LAYERS=${INT8_LAYERS-mlp|linear_attn|self_attn}
 qwen_int8_exports "$INT8_ACT" "$INT8_LAYERS"
 # PREFILL_ATTN=int8: int8-QK Triton attention for the hd256 full-attention
@@ -212,17 +220,29 @@ FA2_SPEC_ATTN=   # set by the FA2_FP8KV arm below
 if [ "$CTX" = "fast" ]; then
   MAX_LEN=${MAX_LEN:-65536}
   DRAFT_TOKENS=${DRAFT_TOKENS:-4}
-  ATTN_ARGS="--attention-backend FLASH_ATTN --kv-cache-dtype bfloat16"
+  if [ "${ROCM:-0}" = 1 ]; then
+    ATTN_ARGS="--attention-backend TRITON_ATTN --kv-cache-dtype bfloat16"
+  else
+    ATTN_ARGS="--attention-backend FLASH_ATTN --kv-cache-dtype bfloat16"
+  fi
   export VLLM_SPEC_DECODE_ATTN=${SPEC_ATTN:-1}
 elif [ "$CTX" = "huge" ]; then
   MAX_LEN=${MAX_LEN:-200000}
   DRAFT_TOKENS=${DRAFT_TOKENS:-3}
   ATTN_ARGS="--kv-cache-dtype kvarn_k4v2_g128 --block-size 128"
   export KVARN_POOL_MEM_FRAC=${KVARN_POOL_MEM_FRAC:-0.15}
+  if [ "${ROCM:-0}" = 1 ]; then
+    export KVARN_FP16_DEQUANT=${KVARN_FP16_DEQUANT:-1}
+  fi
 elif [ "$CTX" = "long" ]; then
   MAX_LEN=${MAX_LEN:-150000}
   DRAFT_TOKENS=${DRAFT_TOKENS:-3}
-  ATTN_ARGS="--kv-cache-dtype fp8"
+  if [ "${ROCM:-0}" = 1 ]; then
+    ATTN_ARGS="--attention-backend TRITON_ATTN --kv-cache-dtype int8_per_token_head"
+    export VLLM_SPEC_DECODE_ATTN=${SPEC_ATTN:-1}
+  else
+    ATTN_ARGS="--kv-cache-dtype fp8"
+  fi
 fi
 if [ "$SPEC" = "dflash2" ] && [ "$CTX" = "long" ]; then
   # int8 per-token-head KV on the Triton backend (the FA2_FP8KV=0 arm; see below): the same 5.2 GiB pool holds 136,429
@@ -957,6 +977,10 @@ if grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null || [ -n "${WSL_DIST
   fi
   [ -z "${PYTORCH_CUDA_ALLOC_CONF:-}" ] && echo \
     "WSL detected: PYTORCH_CUDA_ALLOC_CONF=$ALLOC_DEFAULT (VMM breaks Marlin repack under the paravirt driver; set it explicitly to override)"
+elif [ "${ROCM:-0}" = 1 ]; then
+  ALLOC_DEFAULT=expandable_segments:False
+  [ -z "${PYTORCH_CUDA_ALLOC_CONF:-}" ] && echo \
+    "[start_qwen] ROCM=1: PYTORCH_CUDA_ALLOC_CONF=$ALLOC_DEFAULT (VMM causes GPU memory fault on ROCm/gfx1100)"
 else
   ALLOC_DEFAULT=expandable_segments:True
 fi

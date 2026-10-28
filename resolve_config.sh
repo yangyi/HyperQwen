@@ -51,6 +51,11 @@ resolve_effective_config() {
     || _refuse "unknown mode $mode (want batch|single)"
   [ -n "${REPO:-}" ] || _refuse "REPO is unset"
 
+  case "${ROCM:-}" in
+    ""|0|1) ;;
+    *) _refuse "ROCM=$ROCM: set it to 0 or 1" ;;
+  esac
+
   # 1. Validate the enumerated controls. Defaults mirror the launchers.
   local ctx=${CTX:-} spec=${SPEC:-} kv=${KV:-}
   if [ "$mode" = "single" ]; then
@@ -62,6 +67,10 @@ resolve_effective_config() {
       *) _refuse "unknown SPEC=$spec (want mtp|dflash2|off|none)" ;;
     esac
     [ -z "${KV:-}" ] || _warn "KV=$KV is set but single-user mode ignores it (KV is a batch-mode control)"
+    if [ "${ROCM:-0}" = 1 ]; then
+      [ "${PTH_FA:-0}" = 1 ] && _refuse "ROCM=1 does not support PTH_FA=1 (pthfa/ is a CUDA sm80/86/89 extension)"
+      [ "${FA2_FP8KV:-0}" = 1 ] && _refuse "ROCM=1 does not support FA2_FP8KV=1 (fa2/ is a CUDA sm86 extension)"
+    fi
     # FA2_FP8KV (fp8 KV on the FA2 plugin, fa2/) is one arm, and this is the one place that resolves
     # it. Unset or empty means on for SPEC=dflash2 CTX=long on an 8.6 GPU and off everywhere else (left unset, so
     # every other arm's environment is untouched). The FA2 backend supports only the LBNHC
@@ -95,7 +104,8 @@ resolve_effective_config() {
     PTH_FA_SRC=explicit
     if [ -z "${PTH_FA:-}" ]; then
       PTH_FA_SRC=default
-      local _pth_arm=
+      if [ "${ROCM:-0}" != 1 ]; then
+        local _pth_arm=
       case "$spec/$ctx" in
         dflash2/long)
           [ -z "${FA2_FP8KV:-}" ] && [ "${DRAFT_METHOD:-dflash}" = dflash ] && [ "${DFLASH_TOKENS:-7}" = 7 ] \
@@ -118,12 +128,15 @@ resolve_effective_config() {
           echo "resolve_config: PTH_FA defaults to 1 on $_pth_arm on compute capability 8.6, but the pth_flash_attn package is not in the venv, so the arm's own default runs (bash pthfa/install.sh to use it; PTH_FA=0 silences this)" >&2
         fi
       fi
+      fi
     fi
     FA2_FP8KV_SRC=explicit
     if [ -z "${FA2_FP8KV:-}" ]; then
       FA2_FP8KV_SRC=default
       if [ "$spec" = dflash2 ] && [ "$ctx" = long ]; then
-        if [ -n "$_fa2_tier" ]; then
+        if [ "${ROCM:-0}" = 1 ]; then
+          FA2_FP8KV_SRC="default, off: ROCM=1"
+        elif [ -n "$_fa2_tier" ]; then
           FA2_FP8KV_SRC="default, off: $_fa2_tier"
           echo "resolve_config: FA2_FP8KV defaults to 0 with $_fa2_tier: the FA2 arm's LBNHC KV layout does not fit the OffloadingConnector, so this stays on int8 + Triton (set FA2_FP8KV=0 to silence this)" >&2
         else
@@ -152,10 +165,13 @@ resolve_effective_config() {
         || _refuse "FA2_FP8KV=1 with $_fa2_tier: the FA2 backend supports only the LBNHC KV layout and vLLM's OffloadingConnector needs LBHNC or BLHNC; the CPU tier is untested on it (FA2_FP8KV=0, or no KV offload tier)"
     fi
   else
-    kv=${kv:-fp8}
+    if [ "${ROCM:-0}" = 1 ]; then kv=${kv:-int4pth}; else kv=${kv:-fp8}; fi
     case "$kv" in fp8|kvarn|int4pth) ;;
       *) _refuse "unknown KV=$kv (want fp8|kvarn|int4pth)" ;;
     esac
+    if [ "${ROCM:-0}" = 1 ] && [ "$kv" = "fp8" ]; then
+      _refuse "ROCM=1 does not support KV=fp8 (FlashInfer and native fp8e4nv are CUDA-only; use KV=int4pth or KV=kvarn)"
+    fi
     [ -z "${CTX:-}" ] || _warn "CTX=$CTX is set but batch mode ignores it (CTX is a single-user control)"
     [ -z "${SPEC:-}" ] || _warn "SPEC=$SPEC is set but batch mode ignores it (SPEC is a single-user control)"
     [ -z "${PTH_FA:-}" ] || [ "$PTH_FA" = 0 ] \
@@ -186,6 +202,7 @@ resolve_effective_config() {
   [ -f "$REPO/api_key.txt" ] && _keyfile="present"
   {
     echo "[effective-config] MODE=$mode"
+    [ "${ROCM:-0}" = 1 ] && echo "[effective-config] ROCM=1"
     [ "$mode" = "single" ] \
       && echo "[effective-config] CTX=$ctx SPEC=$spec FA2_FP8KV=${FA2_FP8KV:-0} (${FA2_FP8KV_SRC:-explicit})" \
       || echo "[effective-config] KV=$kv"

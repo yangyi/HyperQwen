@@ -90,6 +90,7 @@ none, and the `.sh` scripts ask `/v1/models`. The `.sh` measurements take `PORT`
 | `test_port_paths.py` | test | CPU, bash, git | 0 or 1 | Export, port drift and triage against a real checkout with spaces in its path. |
 | `test_quant_schema.py` | test | torch and the prepare stack | 0 or 1 | What `prepare/quant_schema.py` writes for every in-place quant script: the packed tensors and their scale dtype, the killed-run check, the index entries, the config group. |
 | `test_replay_offload.py` | test | CPU | 0 or 1 | Replay verdicts on CPU stubs: eviction, TTFT and byte deltas, fresh/legacy counters, exact metric families and interrupted requests. |
+| `test_rocm_knob.sh` | test | CPU, bash, tar | 0 or 1 | ROCm knob validation across launchers, config resolver, attention backends, KV cache dtypes, and Marlin/dequant settings. |
 | `test_generation_state.py` | test | CPU | 0 or 1 | Resume after torn JSON/UTF-8 tails, record-shape refusal, process exclusion before engine startup, and lock release on exceptions/process exit. |
 | `test_spec_decode_attn.py` | kernel test | GPU | 0 or 1 | The split-KV spec-decode attention against a reference. The timing rows are informational. |
 | `test_spec_decode_bigpool.py` | kernel test | GPU | 0 or 1. The fp8 part skips below sm89 or without the fp8 path. | int32 overflow in `_spec_attn_partial` on a large pool (#86). |

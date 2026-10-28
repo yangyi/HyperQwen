@@ -18,10 +18,15 @@ qwen_check_bool_knobs
 qwen_fa2_fp8kv_single_only alternative.sh
 qwen_kv_offload_args
 qwen_prefix_cache
-
+if [ "${ROCM:-0}" = 1 ]; then
+  export VLLM_ROCM_USE_AITER=${VLLM_ROCM_USE_AITER:-0}
+  export VLLM_ROCM_USE_AITER_CUSTOM_AR=${VLLM_ROCM_USE_AITER_CUSTOM_AR:-0}
+fi
 if grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null || [ -n "${WSL_DISTRO_NAME:-}" ]; then
   ALLOC_DEFAULT=expandable_segments:False
   export VLLM_WSL2_ENABLE_PIN_MEMORY=1
+elif [ "${ROCM:-0}" = 1 ]; then
+  ALLOC_DEFAULT=expandable_segments:False
 else
   ALLOC_DEFAULT=expandable_segments:True
 fi
@@ -64,6 +69,10 @@ export VLLM_INT4_MQ_3D=${INT4_MQ_3D:-1}
 # decode 8 to 13% lower and the KV pool 22% smaller with it on, and the quality trade is the documented int8 one,
 # so it stays opt-in here too. INT8_LAYERS narrows it the same way.
 INT8_ACT=${INT8_ACT-}
+if [ "${ROCM:-0}" = 1 ] && [ -n "${INT8_ACT:-}" ]; then
+  echo "[alternative] ROCM=1: ignoring INT8_ACT=$INT8_ACT (Marlin W4A8 is CUDA-only)" >&2
+  INT8_ACT=
+fi
 INT8_LAYERS=${INT8_LAYERS-mlp|linear_attn|self_attn}
 qwen_int8_exports "$INT8_ACT" "$INT8_LAYERS"
 

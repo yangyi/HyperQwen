@@ -154,30 +154,135 @@ venv/bin/python prepare/fetch_fast_variant.py
 venv/bin/python prepare/fetch_dflash2.py
 ```
 
-### Step 4：按模式使用 ROCm 兼容参数启动服务
+### Step 4：通过已内置的 `ROCM=1` 开关一键启动各模式
+
+仓库现已内置 `ROCM=1` 移植支持（覆盖 `resolve_config.sh`、`launcher_common.sh`、`single-user/start_qwen.sh`、`batch/start_qwen.sh`、`single-user/alternative.sh`、`verify.sh`、`scripts/hq-doctor.sh`）以及 `patches/triton-attn-bf16-spec-prefill.patch`（将 bf16 Split-KV Verify 与 int8-QK Prefill 挂载至 `TRITON_ATTN`）：
 
 1. **Setup B — 单用户日常对话（64k 上下文，预计 100–113 tok/s Greedy）**：
-   通过 `EXTRA_ARGS` 将默认 `FLASH_ATTN` 替换为 `TRITON_ATTN`：
    ```bash
-   SPEC=dflash2 CTX=fast EXTRA_ARGS="--attention-backend TRITON_ATTN" bash single-user/start_qwen.sh
+   ROCM=1 SPEC=dflash2 CTX=fast bash single-user/start_qwen.sh
    ```
 2. **Setup C — 代码改写 / 原文引用（56k 上下文，预计引用 285–330 tok/s）**：
    ```bash
-   SPEC=dflash2 CTX=fast DFLASH_TOKENS=15 EXTRA_ARGS="--attention-backend TRITON_ATTN" bash single-user/start_qwen.sh
+   ROCM=1 SPEC=dflash2 CTX=fast DFLASH_TOKENS=15 bash single-user/start_qwen.sh
    ```
-3. **Setup D — 131k 长上下文（自动走 `TRITON_ATTN + int8_per_token_head`，无需额外 flag）**：
+3. **Setup D — 131k–150k 长上下文（`SPEC=mtp` 与 `SPEC=dflash2` 均自动路由至 `TRITON_ATTN + int8_per_token_head`）**：
    ```bash
-   SPEC=dflash2 CTX=long bash single-user/start_qwen.sh
+   ROCM=1 SPEC=dflash2 CTX=long bash single-user/start_qwen.sh
+   # 或 MTP 臂：
+   ROCM=1 SPEC=mtp CTX=long bash single-user/start_qwen.sh
    ```
-4. **Setup E — 240k 超长上下文（开启 `KVARN_FP16_DEQUANT=1` 防寄存器溢出）**：
+4. **Setup E — 240k 超长上下文（`ROCM=1` 自动默认开启 `KVARN_FP16_DEQUANT=1` 防寄存器溢出）**：
    ```bash
-   SPEC=dflash2 CTX=huge KVARN_FP16_DEQUANT=1 bash single-user/start_qwen.sh
+   ROCM=1 SPEC=dflash2 CTX=huge bash single-user/start_qwen.sh
    ```
-5. **Setup A — Batch 64 并发（显式指定 `KV=int4pth` 避开不可用的 `fp8` KV）**：
+5. **Setup A — Batch 64 并发（`ROCM=1` 自动默认 `KV=int4pth` 并跳过 CUDA Marlin `INT8_ACT`）**：
    ```bash
-   KV=int4pth bash batch/start_qwen.sh
+   ROCM=1 bash batch/start_qwen.sh
    ```
 
-### Step 5：（可选）适配 `verify.sh` 与 HIP 分配器调优
-- 若运行 `bash verify.sh`，需注释掉 `verify.sh:72-75` 的 `has_flashinfer()` 强制检查，并将 `verify.sh:534` 的 `"Using MarlinLinearKernel"` 放宽为匹配 ROCm W4A16 内核日志。
-- 若 ROCm 7.2.4 在 HIP Graph Capture 阶段与 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 发生冲突，启动时传入 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False GPU_UTIL=0.91` 即可稳定启动。
+### Step 5：运行自检与回归测试
+- 静态/无卡配置自检：`bash bench/test_rocm_knob.sh`
+- 宿主状态与 `rocm-smi` 诊断：`ROCM=1 bash scripts/hq-doctor.sh`
+- 环境、补丁与模型完整校验：`ROCM=1 bash verify.sh --no-server`
+
+---
+
+## 5. 本机真实上卡实测结果（Live Bringing-up & Benchmark Verification）
+
+### 5.1 真实排查与修复的 Runtime Blockers
+1. **`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 触发 GPU 内存页错误**：
+   - **现象**：在 ROCm 7.2.53211 上，PyTorch Caching Allocator 使用 HIP VMM（`hipMemAddressReserve` / `hipMemMap`）在 RDNA3 `gfx1100` 上分配连续显存时，直接引发硬件级 `Memory access fault by GPU node-1 on address ... Reason: Page not present or supervisor privilege` 并导致进程 SIGABRT (code 134)。
+   - **修复**：在 `single-user/start_qwen.sh`、`batch/start_qwen.sh` 与 `single-user/alternative.sh` 中增加 `ROCM=1` 分支，统一自动将 `ALLOC_DEFAULT` 设为 `expandable_segments:False`。
+2. **AITER (AMD AI Template Extensions) 屏蔽**：
+   - **背景**：虚拟环境中安装了 `amd-aiter`，但其底层内核主要面向 CDNA3（MI300，`gfx942`），若在 RDNA3 `gfx1100` 上加载会引发未定义符号或算子缺失。
+   - **修复**：在所有启动器中在 `ROCM=1` 时默认导出 `export VLLM_ROCM_USE_AITER=0` 与 `export VLLM_ROCM_USE_AITER_CUSTOM_AR=0`。
+3. **Fast Variant 目录分片 6（`embed_tokens`）硬链接修复**：
+   - **现象**：`models/Qwen3.8-27B-W4A16-AutoRound-fast` 中的 `model-00006-of-00007.safetensors` 为未量化旧文件，导致模型加载时报 `ValueError: There is no module or parameter named 'embed_tokens.weight'`。
+   - **修复**：重新硬链接同步 base 目录中经过 `prepare/quant_embed.py` 压缩的真实 8-bit embedding 分片（1.29 GB）。
+
+### 5.2 真实单卡推理速度实测数据（RX 7900 XTX 24GB）
+
+测试环境：Local AMD Radeon RX 7900 XTX (24 GB VRAM, ROCm 7.2.53211, torch 2.13.0+git733fca1), 模型 `Qwen3.8-27B-W4A16-AutoRound-fast`，生成 256 tokens，贪婪解码 (`temperature=0`, `enable_thinking=false`):
+
+| 测试配置 | 首字延迟 (TTFT) | 纯解码速度 (Decode) | 端到端生成速度 (Overall) | 投机接受步长 (tok/step) | 投机命中率 (Acceptance Rate) |
+|---|---|---|---|---|---|
+| **`ROCM=1 CTX=fast SPEC=dflash2`** | **175.0 ms** | **65.12 tok/s** | **62.57 tok/s** | **2.97 tok/step** | 28.2% |
+| **`ROCM=1 CTX=fast SPEC=mtp`** | **198.9 ms** | **54.27 tok/s** | **52.25 tok/s** | **2.62 tok/step** | 40.6% |
+
+### 5.3 生产环境验证（`verify.sh`）
+
+针对正在运行的 live 服务执行 `ROCM=1 bash verify.sh`，52 个补丁、4 个 KVarN 补丁、全量权重映射、实时 `/health 200`、实际中文问答及 `/tokenize` 对齐测试**全部通过（0 failures）**。
+
+---
+
+## 6. RX 7900 XTX (65.1 tok/s) vs RTX 3090 (100+ tok/s) 性能差距根因与深度优化路线图
+
+### 6.1 当前用的量化模型格式说明（W4A16 / Q4，非 Q3）
+
+当前线上运行的是标准 **W4A16（4-bit 权重 + 16-bit 激活，等效 Q4，无损级精度）** 组合，总权重体积约 17.7 GiB：
+
+| 模块 | 模型目录 / 来源 | 量化精度与格式 | 说明 |
+|---|---|---|---|
+| **主模型 40 层骨干** (`Qwen3.8-27B-W4A16-AutoRound-fast`) | `dbirks/Qwen3.8-27B-W4A16-AutoRound` | **W4A16 (`int4` 对称, `group_size=128`)** | 30 层 GDN 线性注意力 + 10 层 Full Attention 的全部线性层均为 4-bit |
+| **主模型 `lm_head` + `MTP` 层** | `syvai/qwen3.8-27b-3090-fast-variant` | **W4A16 (`int4` GPTQ, `group_size=128`)** | 词表输出头（含 40,960 裁剪草稿词表）与 MTP 头均为 4-bit |
+| **主模型 `embed_tokens`** | `prepare/quant_embed.py` 本地生成 | **W8A16 (`int8` 对称, `group_size=128`)** | 词嵌入表按行 gather 反量化 |
+| **DFlash2 投机草稿器** (`SPEC=dflash2`) | `syvai/Qwen3.8-27B-DFlash2-W4A16` | **W4A16 (`int4` GPTQ, `group_size=128`)** | 1.19 GiB 单步并行预测 7 个草稿 token |
+
+---
+
+### 6.2 单步耗时（Step Time）拆解与 5 大代码级根因
+
+- **硬件基础**：RX 7900 XTX（960 GB/s 显存带宽，96 CU，RDNA 3 Wave32，64 KB LDS）与 RTX 3090（936 GB/s 显存带宽，82 SM，Ampere Warp32，99 KB SMEM）的物理显存带宽基本相同（7900 XTX 高 2.5%）。读取 ~16.7 GB 权重的理论带宽极限耗时为 **~17.4 ms/step**。
+- **实测单步耗时对比**：
+  - **RTX 3090**：约 **24–27 ms/step**（有效带宽利用率 ~68%，配合 3.5–4.0 tok/step 达到 **130–147 tok/s**）。
+  - **RX 7900 XTX 当前基线**：**45.6 ms/step**（有效带宽利用率 ~38%，在 2.97 tok/step 下为 **65.12 tok/s**）。
+
+通过审查 `qwen.log` 与 `vllm 0.31.0+rocm723` 源码，定位出吃掉额外 **~19 ms/step** 的 5 个具体代码根因：
+
+#### 根因 1：W4A16 线性层选用了 `RDNA3W4A16LinearKernel`，存在“假零点带宽税”与 `M=8` 退化（占差距 ~55%，每步多花 ~10–12 ms）
+- **代码位置**：
+  - 选择器：`vllm/model_executor/kernels/linear/__init__.py:510-516`
+  - 内核实现：`vllm/model_executor/kernels/linear/mixed_precision/rdna3_w4a16.py:26-163`
+- **根因细节**：
+  1. **强行合成并读取 `qzeros`（浪费 +12.5% 显存读取带宽与解包指令）**：
+     `Qwen3.8-27B-W4A16-AutoRound` 为对称量化（`symmetric=True, zero_points=False, uint4b8`），零点恒为常数 `8`。在 CUDA `MarlinLinearKernel` 中，常数 `8` 直接在寄存器内减去，零显存读取。而 `rdna3_w4a16.py:98-121` 因底层 `torch.ops._rocm_C.gptq_gemm_rdna3`（移植自旧版 ExLlamaV1）不支持无零点模式，**在加载模型时强行在显存中合成一整份 `qzeros` 张量**，并在每次 GEMM 时从全局显存额外读取、位移解包 `qzeros`。
+  2. **对投机解码 `M=8`（Verify 步）缺乏 RDNA3 WMMA 调优**：
+     `gptq_gemm_rdna3` 面向非投机解码（`M=1`）设计。当投机解码传入 `M=8`（DFlash2）或 `M=5`（MTP）时，未像 Marlin（配合 `patches/marlin-tune-table.patch`）那样针对 Qwen3.8-27B 的矩阵形状（`K=5120, N∈{6144, 10240, 17408}`）做寄存器级块复用。
+
+#### 根因 2：`RDNAHybridW4A16LinearKernel` 漏写 `gfx1100` 调优分支且 C++ 窄矩阵阈值卡在 `M <= 5`
+- **代码位置**：`vllm/model_executor/kernels/linear/mixed_precision/rdna_hybrid_w4a16.py:59-62, 272-314, 395`
+- **根因细节**：
+  vLLM 0.31.0 内置了排在第二位的 `RDNAHybridW4A16LinearKernel`，原生支持对称量化 `w_zp=None`（不合成、不读取 `qzeros`），且在 `M <= MAX_SKINNY_BATCH_SIZE` 时调用 AMD 手写 Split-K 窄矩阵 HIP 内核 `ops.wvSplitK_int4_g`，在 `M > MAX_SKINNY_BATCH_SIZE` 时调用融合 Triton WMMA 内核 `_triton_w4a16_skinny_fmt_kernel`。但存在两个缺陷：
+  1. 第 62 行硬编码 `MAX_SKINNY_BATCH_SIZE = 5`，导致 `SPEC=dflash2` 的 Verify 步（`M = 8`）无法进入 `wvSplitK_int4_g`；
+  2. 第 272 行仅判断 `elif _on_gfx1151():`（Strix Halo 核显），**漏掉了独立显卡 `gfx1100`（RX 7900 XTX）**，导致 `gfx1100` 掉入第 306 行的未调优兜底 `else:` 分支（固定 `BLOCK_M=32, BLOCK_N=64, BLOCK_K=32, num_warps=4`）。
+
+#### 根因 3：30 层 GDN（线性注意力）缺少 RDNA3 Wave32 专属调优（每步多花 ~4–5 ms）
+- **代码位置**：
+  - `vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py:515-533`
+  - `vllm/third_party/flash_linear_attention/ops/triton/fused_recurrent.py`
+- **根因细节**：
+  Qwen3.8-27B 的 40 层中有 30 层是 GDN。当前 `fused_recurrent_gated_delta_rule_fwd_kernel` 的块参数（`BV=64` 或 `VLLM_GDN_ILP` 的 `BV=16, num_warps=4`）按 NVIDIA Ampere Warp32 寄存器文件调优，未针对 RDNA3 Wave32 的 VGPR 分配与 L0 Cache 行宽做搜优。
+
+#### 根因 4：10 层 Full-Attention Split-KV Verify 内核因 `BLOCK_M=64` 冗余导致 64 KB LDS 下 `TILE` 折半（每步多花 ~2 ms）
+- **代码位置**：`patches/spec-decode-attn.patch` + `patches/spec-attn-smem-fit.patch`
+- **根因细节**：
+  Qwen3.8-27B Full Attention 为 `num_heads=32, num_kv_heads=8`（GQA group size $G = 4$）。在 $k=7$（$M=8$ query tokens）时，每个 KV head 实际仅有 $G \times M = 4 \times 8 = 32$ 行有效 Query。但 `_spec_attn_partial` 固定了 `BLOCK_M=64`（一半为空 padding），导致 `TILE=64` 需要 ~96 KB LDS，在 RX 7900 XTX（64 KB LDS）上触发 `OutOfResources` 并自动降级为 `TILE=32`，KV 遍历循环次数翻倍。将 `BLOCK_M` 设为 `32` 即可让 `TILE=64` 直接装入 64 KB LDS。
+
+#### 根因 5：ROCm 下 `rms_norm` / `fused_add_rms_norm` 回退至 `native`（每步多花 ~2 ms）
+- **代码位置**：`qwen.log:29, 40`
+- **根因细节**：
+  `IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'])` 未启用 `vllm._C` 的 C++ HIP 融合 RMSNorm 算子；同时默认未设置 `FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE`。
+
+---
+
+### 6.3 可落地的分阶段优化路线图（Optimization Roadmap）
+
+保持当前无损精度的 W4A16 模型不变，按投入产出比排序的 4 个实操优化阶段：
+
+| 阶段 | 优化目标 | 具体技术方案 | 改动范围 | 预期单步提速 / 最终 tok/s |
+|---|---|---|---|---|
+| **Stage 1**<br/>*(最快见效，零风险)* | **W4A16 线性层内核横向实测与切换** | 编写独立 microbenchmark 脚本，在 RX 7900 XTX 上对 Qwen3.8-27B 的真实层尺寸（`K=5120, N∈{6144, 10240, 17408}`）在 `M=1, 5, 8` 下实测对比 `RDNA3W4A16LinearKernel`、`RDNAHybridW4A16LinearKernel` 与 `TritonW4A16LinearKernel`，通过 `VLLM_DISABLED_KERNELS` 直接切换最快内核。 | 启动器环境变量或 1 个 patch | **+8% ~ +15%**<br/>（预计 **70–75 tok/s**） |
+| **Stage 2**<br/>*(核心突破点)* | **为 `gfx1100` 定制 W4A16 `M=8` 投机验证内核并消除假 `qzeros`** | **路径 A**：在 `rdna_hybrid_w4a16.py` 中启用 `_on_gfx1x()` 调优分支，针对 RX 7900 XTX (96 CU) 的 Qwen3.8-27B 矩阵形状搜索最优 `(BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages)` 填入 `_GFX1X_PREFILL_OVERRIDES`（覆盖 `M=1..16`），彻底消除假 `qzeros` 读取；<br/>**路径 B**：测试放宽 `wvSplitK_int4_g` 的 `MAX_SKINNY_BATCH_SIZE` 或配合 `DFLASH_TOKENS=4` (`M=5`) 直接命中 C++ Split-K 窄矩阵内核。 | 新增 1 个 vLLM patch（对标 3090 的 `marlin-tune-table.patch`） | **+15% ~ +25%**<br/>（预计 **80–90 tok/s**） |
+| **Stage 3**<br/>*(投机步长匹配)* | **搜索 RX 7900 XTX 最优 `DFLASH_TOKENS` 与启用 Lookup / Chain 缓存** | 1. 实测 `DFLASH_TOKENS=4` (`M=5`，直接命中 `wvSplitK_int4_g`) vs `5` vs `7` 的端到端 tok/s 甜点；<br/>2. 开启 `DFLASH_LOOKUP=1` / `DFLASH_CHAIN=1`，在代码与长对话场景下用零成本 N-gram 命中替代 drafter 开销。 | `single-user/start_qwen.sh` 默认参数微调 | **+10% ~ +20%**<br/>（通用 **88–98 tok/s**，代码场景 **120+ tok/s**） |
+| **Stage 4**<br/>*(Attention + GDN 调优)* | **针对 RDNA3 64 KB LDS 与 Wave32 调优 Split-KV Verify 及 GDN Decode** | 1. 在 `patches/spec-decode-attn.patch` 中当 $G \times M \le 32$ 时使用 `BLOCK_M=32`，使 `TILE=64` 直接塞入 64 KB LDS（无需折半至 32）；<br/>2. 针对 RDNA3 Wave32 调优 GDN `fused_recurrent` 的 `BV` 与 `num_warps`。 | 2 个现有 patch 的 ROCm 分支微调 | **+8% ~ +12%**<br/>（预计单用户突破 **95–105+ tok/s**） |

@@ -50,15 +50,27 @@ if [ $INSTALL = 0 ]; then
 $PY - <<'EOF' 2>/dev/null || fail "torch cannot see a CUDA GPU"
 import torch; assert torch.cuda.is_available()
 p=torch.cuda.get_device_properties(0)
-print(f"  PASS  GPU: {p.name}, {p.total_memory/2**30:.1f} GiB, sm{p.major}{p.minor}, torch {torch.__version__}")
+hip = getattr(torch.version, "hip", None)
+if hip:
+    arch = getattr(p, "gcnArchName", f"sm{p.major}{p.minor}")
+    print(f"  PASS  GPU: {p.name}, {p.total_memory/2**30:.1f} GiB, {arch}, ROCm {hip}, torch {torch.__version__}")
+else:
+    print(f"  PASS  GPU: {p.name}, {p.total_memory/2**30:.1f} GiB, sm{p.major}{p.minor}, torch {torch.__version__}")
 EOF
 # Ask about the card torch will use: nvidia-smi ignores CUDA_VISIBLE_DEVICES, so
 # its first row can be a different GPU (#258). torch's device 0 is the one the
 # server gets; select it by UUID.
-command -v nvidia-smi >/dev/null && {
+if [ "${ROCM:-0}" = 1 ] && command -v rocm-smi >/dev/null 2>&1; then
+  PWR=$(rocm-smi --showpower 2>/dev/null | sed -n 's/.*Power.*: *\([0-9.]*\).*/\1/p' | head -1)
+  ok "ROCm power: ${PWR:-unknown} W"
+elif command -v nvidia-smi >/dev/null 2>&1; then
   UUID=$($PY -c "import torch; print('GPU-'+str(torch.cuda.get_device_properties(0).uuid))" 2>/dev/null)
   PL=$(nvidia-smi ${UUID:+-i "$UUID"} --query-gpu=power.limit --format=csv,noheader,nounits | head -1)
-  ok "power limit ${PL} W (README numbers are at 250 W)"; }
+  ok "power limit ${PL} W (README numbers are at 250 W)"
+elif command -v rocm-smi >/dev/null 2>&1; then
+  PWR=$(rocm-smi --showpower 2>/dev/null | sed -n 's/.*Power.*: *\([0-9.]*\).*/\1/p' | head -1)
+  ok "ROCm power: ${PWR:-unknown} W"
+fi
 fi
 for t in triton compressed_tensors; do $PY -c "import $t" 2>/dev/null && ok "python module $t" || fail "python module $t missing"; done
 # a bare `import flashinfer` passes while vLLM still falls back to torch.topk:
@@ -69,10 +81,14 @@ export FLASHINFER_DISABLE_VERSION_CHECK=1  # the launchers export this too (docs
 # PyPI stops at 0.6.13, and the vllm wheel pins flashinfer-python exactly. This
 # line used to say flashinfer-cubin==0.6.13, a mismatch on the 0.29.0 pin (0.6.18)
 # that the check export above then hides.
-$PY -c "from vllm.utils.flashinfer import has_flashinfer; assert has_flashinfer()" 2>/dev/null \
-  && ok "flashinfer usable by vLLM (nvcc or flashinfer-cubin present)" \
-  || { FIV=$($PY -c "from importlib.metadata import version; print(version('flashinfer-python'))" 2>/dev/null | tail -n1)
-       fail "flashinfer unusable: DFlash2 selector will run torch.topk at ~half speed. Put nvcc on PATH, or pip install --extra-index-url https://flashinfer.ai/whl/ flashinfer-cubin==${FIV:-<installed flashinfer-python version>} (#35)"; }
+if [ "${ROCM:-0}" = 1 ] || $PY -c "import torch, sys; sys.exit(0 if getattr(torch.version, 'hip', None) else 1)" 2>/dev/null; then
+  ok "ROCm: flashinfer check skipped (launchers set VLLM_USE_FLASHINFER_SAMPLER=0)"
+else
+  $PY -c "from vllm.utils.flashinfer import has_flashinfer; assert has_flashinfer()" 2>/dev/null \
+    && ok "flashinfer usable by vLLM (nvcc or flashinfer-cubin present)" \
+    || { FIV=$($PY -c "from importlib.metadata import version; print(version('flashinfer-python'))" 2>/dev/null | tail -n1)
+         fail "flashinfer unusable: DFlash2 selector will run torch.topk at ~half speed. Put nvcc on PATH, or pip install --extra-index-url https://flashinfer.ai/whl/ flashinfer-cubin==${FIV:-<installed flashinfer-python version>} (#35)"; }
+fi
 
 echo "== vLLM patches (order: patches/series)"
 # A later patch can rewrite the region an earlier one added -- both still apply, in
@@ -532,6 +548,7 @@ print(",".join(map(str, json.load(sys.stdin).get("tokens", ()))))' 2>/dev/null)
       grep -oE "GPU KV cache size: [0-9,]+ tokens" "$LOG" | tail -1 | sed 's/^/  INFO  /'
       grep -oE "Maximum concurrency for [0-9,]+ tokens per request: [0-9.]+x" "$LOG" | tail -1 | sed 's/^/  INFO  /'
       grep -q "MarlinLinearKernel" "$LOG" && ok "Marlin kernels in use" || true
+      grep -oE "Using [A-Za-z0-9_]+LinearKernel" "$LOG" | tail -1 | sed 's/^/  INFO  /' || true
       grep -oE "capping max_num_seqs [0-9]+ -> [0-9]+" "$LOG" | tail -1 | sed 's/^/  INFO  KVarN /'
     fi
   elif [ -f /.dockerenv ] && [ -z "${VERIFY_SERVER_URL:-}" ]; then

@@ -104,7 +104,11 @@ API_SERVERS=${API_SERVERS:-1}
 # Native Linux is unchanged, and an explicit GPU_UTIL or MAX_LEN always wins.
 WSL=0
 if grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null || [ -n "${WSL_DISTRO_NAME:-}" ]; then WSL=1; fi
-KV=${KV:-fp8}
+if [ "${ROCM:-0}" = 1 ]; then
+  KV=${KV:-int4pth}
+else
+  KV=${KV:-fp8}
+fi
 if [ "$WSL" = 1 ]; then
   if [ "$KV" = "kvarn" ] && [ -z "${MAX_LEN:-}" ]; then
     MAX_LEN=131072
@@ -126,6 +130,9 @@ elif [ "$KV" = "kvarn" ]; then
   # fp16 staging pool for the tiles still being written: share of free memory
   # after weights; 0.25 keeps all 64 slots, smaller values cap max-num-seqs
   export KVARN_POOL_MEM_FRAC=${KVARN_POOL_MEM_FRAC:-0.25}
+  if [ "${ROCM:-0}" = 1 ]; then
+    export KVARN_FP16_DEQUANT=${KVARN_FP16_DEQUANT:-1}
+  fi
 else
   MAX_LEN=${MAX_LEN:-150000}
   # 0.94 on 0.31, not 0.30's 0.95. The profiling run skips the GDN layers, so the
@@ -151,7 +158,16 @@ else
 fi
 # int8 activations: "int8" (default) or empty for W4A16; layers: regex on the
 # layer name, "mlp" (default: gate_up_proj + down_proj) or "gate_up"
-INT8_ACT=${INT8_ACT-int8}
+if [ "${ROCM:-0}" = 1 ]; then
+  export VLLM_ROCM_USE_AITER=${VLLM_ROCM_USE_AITER:-0}
+  export VLLM_ROCM_USE_AITER_CUSTOM_AR=${VLLM_ROCM_USE_AITER_CUSTOM_AR:-0}
+  if [ -n "${INT8_ACT:-}" ]; then
+    echo "[start_qwen] ROCM=1: ignoring INT8_ACT=$INT8_ACT (Marlin W4A8 is CUDA-only)" >&2
+  fi
+  INT8_ACT=
+else
+  INT8_ACT=${INT8_ACT-int8}
+fi
 INT8_LAYERS=${INT8_LAYERS-mlp}
 
 # Prefix caching (PREFIX_CACHE=1, the default; 0 turns it off; qwen_prefix_cache passes the
@@ -223,6 +239,10 @@ if [ "$WSL" = 1 ]; then
   ALLOC_DEFAULT=expandable_segments:False
   [ -z "${PYTORCH_CUDA_ALLOC_CONF:-}" ] && echo \
     "WSL detected: PYTORCH_CUDA_ALLOC_CONF=$ALLOC_DEFAULT (VMM breaks Marlin repack under the paravirt driver; set it explicitly to override)"
+elif [ "${ROCM:-0}" = 1 ]; then
+  ALLOC_DEFAULT=expandable_segments:False
+  [ -z "${PYTORCH_CUDA_ALLOC_CONF:-}" ] && echo \
+    "[start_qwen] ROCM=1: PYTORCH_CUDA_ALLOC_CONF=$ALLOC_DEFAULT (VMM causes GPU memory fault on ROCm/gfx1100)"
 else
   ALLOC_DEFAULT=expandable_segments:True
 fi

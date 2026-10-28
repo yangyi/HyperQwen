@@ -34,8 +34,12 @@ else
 fi
 
 say "== gpu"
-if command -v nvidia-smi >/dev/null 2>&1; then
+if [ "${ROCM:-0}" = 1 ] && command -v rocm-smi >/dev/null 2>&1; then
+  rocm-smi --showproductname --showmeminfo vram 2>/dev/null | grep -E 'Card Series|VRAM Total' | sed 's/^/  /' || warn "rocm-smi failed"
+elif command -v nvidia-smi >/dev/null 2>&1; then
   nvidia-smi --query-gpu=name,memory.used,memory.total,power.limit --format=csv,noheader 2>/dev/null | sed 's/^/  /' || warn "nvidia-smi failed"
+elif command -v rocm-smi >/dev/null 2>&1; then
+  rocm-smi --showproductname --showmeminfo vram 2>/dev/null | grep -E 'Card Series|VRAM Total' | sed 's/^/  /' || warn "rocm-smi failed"
 else
   warn "nvidia-smi not on PATH (WSL: run inside the distro; Windows: drivers)"
 fi

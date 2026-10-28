@@ -1,0 +1,82 @@
+Hook the split-KV Triton verify attention and the int8-QK prefill attention
+into TRITON_ATTN for unquantized bfloat16 KV caches, so cards running
+--attention-backend TRITON_ATTN --kv-cache-dtype bfloat16 (such as ROCm
+gfx1100 under CTX=fast) do not fall back to un-split unified_attention on
+multi-query speculative verify steps.
+
+Kind: feature
+What: hook split-KV verify and int8-QK prefill attention into TRITON_ATTN for bf16 KV caches
+Upstream: none
+Cut-against: 0.31.0
+Retires-when: rides with spec-decode-attn and prefill-attn-int8
+
+--- exported from fc0c83e (triton-attn-bf16-spec-prefill); regenerate with scripts/export-patch.sh, do not edit ---
+
+diff --git a/v1/attention/backends/triton_attn.py b/v1/attention/backends/triton_attn.py
+index cde2e4c..c3d1fbc 100644
+--- a/v1/attention/backends/triton_attn.py
++++ b/v1/attention/backends/triton_attn.py
+@@ -861,6 +861,44 @@
+ 
+         mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
+ 
++        # syv patch: int8-QK Triton prefill attention for head_dim 256 on TRITON_ATTN
++        if (
++            envs.VLLM_PREFILL_ATTN in ("int8", "fp16")
++            and max_seqlen_q > 16
++            and cu_seqlens_q.shape[0] == 2
++            and self.num_heads == 24 and self.num_kv_heads == 4
++            and self.head_size == 256
++            and self._kv_quant_mode == KVQuantMode.NONE
++            and key_cache.dtype == torch.bfloat16
++            and (self.sliding_window is None or self.sliding_window == (-1, -1))
++            and not self.logits_soft_cap
++            and self.alibi_slopes is None
++            and self.sinks is None
++            and attn_metadata.causal
++            and self.chunk_lookback == -1
++            and mm_prefix_range_tensor is None
++            and attn_metadata.rswa_prefix_lens is None
++            and output_scale is None
++        ):
++            from vllm.v1.attention.backends.prefill_attn_hd256 import (
++                prefill_attn as _prefill_attn_hd256,
++            )
++            _kv_len = int(seqused_k[0].item())
++            _q_len = int(num_actual_tokens)
++            _prefill_attn_hd256(
++                query[:num_actual_tokens],
++                key_cache,
++                value_cache,
++                output[:num_actual_tokens],
++                block_table[0],
++                _kv_len,
++                _kv_len - _q_len,
++                self.scale,
++                int8_qk=envs.VLLM_PREFILL_ATTN == "int8",
++                block_t=128, block_n=64, num_warps=8, num_stages=3,
++            )
++            return output
++
+         # syv patch: the split-KV Triton verify attention (patches/spec-decode-attn.patch),
+         # which vLLM's own unified attention cannot do here -- it refuses to split the KV
+         # sequence whenever max_seqlen_q > 1 (triton_unified_attention.py, `use_3d`), and
+@@ -876,6 +914,10 @@
+             self._kv_quant_mode == KVQuantMode.FP8_PER_TENSOR
+             and key_cache.dtype == self.fp8_dtype
+         )
++        spec_bf16 = (
++            self._kv_quant_mode == KVQuantMode.NONE
++            and key_cache.dtype == torch.bfloat16
++        )
+         if envs.VLLM_SPEC_ATTN_DEBUG and max_seqlen_q > 1 and not getattr(self, "_spec_dbg_logged", False):
+             self._spec_dbg_logged = True
+             logger.info(
+@@ -889,6 +931,7 @@
+             _spec_attn_enabled()
+             and (
+                 spec_fp8
++                or spec_bf16
+                 or (
+                     k_scale_cache is not None
+                     and self._kv_quant_mode == KVQuantMode.INT8_PER_TOKEN_HEAD
